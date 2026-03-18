@@ -1,0 +1,37 @@
+#!/bin/bash
+
+# Отключение NetworkManager
+for service in NetworkManager; do systemctl stop $service; systemctl disable $service; systemctl mask $service; done
+
+# Настройка сетевых интерфейсов
+connections=$(ifconfig -s | awk '{print $1}')
+static_interface=$(echo $connections | awk '{print $2}')
+dynamic_interface=$(echo $connections | awk '{print $3}')
+echo -e "\nauto $static_interface" "\niface $static_interface inet static" "\naddress 192.168.0.1" "\nnetmask 24" "\ndns-nameservers 127.0.0.1" "\ndns-search corp.test" | tee -a /etc/network/interfaces
+echo -e "\nauto $dynamic_interface" "\niface $dynamic_interface inet dhcp" | tee -a /etc/network/interfaces
+systemctl restart networking.service
+
+# Настройка DNS
+echo -e "\nnameserver 127.0.0.1" "\nsearch corp.test" | tee -a /etc/resolv.conf
+hostnamectl set-hostname dc1.corp.test
+chattr +i /etc/resolv.conf
+
+# Натройка репозиториев
+sed -i '/deb cdrom/s/^/#/' /etc/apt/sources.list 
+echo -e "deb http://dl.astralinux.ru/astra/frozen/1.7_x86-64/1.7.6/repository-main 1.7_x86-64 main non-free contrib" | tee -a /etc/apt/sources.list
+echo -e "deb http://dl.astralinux.ru/astra/frozen/1.7_x86-64/1.7.6/repository-update 1.7_x86-64 main contrib non-free" | tee -a /etc/apt/sources.list
+echo -e "deb https://dl.astralinux.ru/aldpro/frozen/01/2.4.0/ 1.7_x86-64 main base" | tee -a /etc/apt/sources.list.d/aldpro.list
+apt update
+apt list --upgradable
+apt dist-upgrade -y -o Dpkg::Options::=--force-confnew
+
+# Установка пакетов и настройка домена
+DEBIAN_FRONTEND=noninteractive apt-get install -y -q aldpro-mp
+aldpro-server-install -d corp.test -n dc1 -p 'P@ssw0rd!' --ip 192.168.0.1 --no-reboot
+
+# Установка vmware драйверов
+apt install open-vm-tools -y
+apt install open-vm-tools-desktop -y
+
+# Перезагрузка компьютера
+init 6

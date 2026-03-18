@@ -1,0 +1,93 @@
+#!/bin/bash
+
+# Настройка сети
+connections=$(ifconfig -s | awk '{print $1}')
+static_interface=$(echo $connections | awk '{print $2}')
+dynamic_interface=$(echo $connections | awk '{print $3}')
+sed -i '/^BOOTPROTO=/s/=.*$/=static/' /etc/net/ifaces/$static_interface/options && sed -i '/^DISABLED=/s/=.*$/=no/' /etc/net/ifaces/$static_interface/options
+sed -i '/^BOOTPROTO=/s/=.*$/=dhcp/' /etc/net/ifaces/$dynamic_interface/options && sed -i '/^DISABLED=/s/=.*$/=no/' /etc/net/ifaces/$dynamic_interface/options
+echo -e "192.168.0.1/24" > /etc/net/ifaces/$static_interface/ipv4address
+
+# Настройка DNS
+echo -e "\nnameserver 127.0.0.1" "\nsearch corp.test" | tee -a /etc/net/ifaces/$static_interface/resolv.conf
+cp /etc/resolv.conf.dnsmasq /etc/net/ifaces/$dynamic_interface/ &&  mv /etc/net/ifaces/$dynamic_interface/resolv.conf.dnsmasq /etc/net/ifaces/$dynamic_interface/resolv.conf
+sed -i '/name_servers=/s/^/#/' /etc/resolvconf.conf
+cat /etc/resolv.conf.dnsmasq >> /etc/resolv.conf
+chattr +i /etc/resolv.conf
+
+# Настройка репозиториев
+sed -i '/http/s/^#\+//' /etc/apt/sources.list.d/alt.list
+apt-get update
+
+# Установка пакетов
+apt-get remove alterator-datetime -y
+apt-get install open-vm-tools-desktop -y
+apt-get install chrony -y
+apt-get install task-samba-dc -y
+apt-get install alterator-fbi -y
+apt-get install task-auth-ad-sssd gpupdate -y
+
+# Настройка NTP сервера
+control chrony server
+sed -i -r 's/^(pool.*)/#\1\npool ru.pool.ntp.org iburst/' /etc/chrony.conf
+systemctl enable --now chronyd
+
+# Настройка домена
+hostnamectl set-hostname dc1.corp.test
+domainname corp.test
+control krb5-conf-ccache default
+for service in smb nmb krb5kdc slapd bind; do systemctl disable $service; systemctl stop $service; done
+sed -i '/name_servers=/s/^#\+//' /etc/resolvconf.conf
+chattr -i /etc/resolv.conf
+resolvconf -u
+rm -f /etc/samba/smb.conf
+samba-tool domain provision --realm=corp.test --domain=corp --adminpass='P@ssw0rd!' --dns-backend=SAMBA_INTERNAL --option="dns forwarder=8.8.8.8" --server-role=dc --use-rfc2307
+systemctl enable --now samba
+\cp /var/lib/samba/private/krb5.conf /etc/krb5.conf
+samba-tool user add testuser P@ssw0rd!
+sed -i '/^ dns_lookup_realm *= */s/=.*$/= false/' /etc/krb5.conf
+sed -i '/default_realm/s/^#\+//' /etc/krb5.conf && sed -i '/^ default_realm *= */s/=.*$/= CORP.TEST/' /etc/krb5.conf
+sed -i '1i\\includedir /etc/krb5.conf.d/\n' /etc/krb5.conf
+sed -i '/libdefaults/a\        ticket_lifetime = 24h' /etc/krb5.conf
+sed -i '/libdefaults/a\        renew_lifetime = 7d' /etc/krb5.conf
+sed -i '/libdefaults/a\        forwardable = true' /etc/krb5.conf
+sed -i '/libdefaults/a\        rdns = false' /etc/krb5.conf
+sed -i 's/^user = .*$/user = root/' /etc/sssd/sssd.conf
+sed -i '/nss/i \\domains = CORP.TEST' /etc/sssd/sssd.conf
+LAST_LINE=$(grep -n '[pam]' /etc/sssd/sssd.conf | tail -1 | cut -d':' -f1) && sed -i "$LAST_LINE a [domain/CORP.TEST]" /etc/sssd/sssd.conf
+sed -i '$a id_provider = ad' /etc/sssd/sssd.conf
+sed -i '$a auth_provider = ad' /etc/sssd/sssd.conf
+sed -i '$a chpass_provider = ad' /etc/sssd/sssd.conf
+sed -i '$a access_provider = ad' /etc/sssd/sssd.conf
+sed -i '$a default_shell = /bin/bash' /etc/sssd/sssd.conf
+sed -i '$a fallback_homedir = /home/%d/%u' /etc/sssd/sssd.conf
+sed -i '$a debug_level = 0' /etc/sssd/sssd.conf
+sed -i '$a ; cache_credentials = false' /etc/sssd/sssd.conf
+sed -i '$a ad_gpo_ignore_unreadable = true' /etc/sssd/sssd.conf
+sed -i '$a ad_gpo_access_control = permissive' /etc/sssd/sssd.conf
+sed -i '$a ad_update_samba_machine_account_password = true' /etc/sssd/sssd.conf
+sed -i '$a ad_maximum_machine_account_password_age = 0' /etc/sssd/sssd.conf
+sed -i '/global/a\        idmap_ldb:use rfc2307 = yes' /etc/samba/smb.conf
+sed -i '/global/a\        kerberos method = system keytab' /etc/samba/smb.conf
+sed -i '/global/a\        template shell = /bin/bash' /etc/samba/smb.conf
+sed -i '/global/a\        template homedir = /home/CORP.TEST/%U' /etc/samba/smb.conf
+sed -i '/global/a\        wins support = no' /etc/samba/smb.conf
+sed -i '/global/a\        winbind use default domain = yes' /etc/samba/smb.conf
+sed -i '/global/a\        winbind enum users = no' /etc/samba/smb.conf
+sed -i '/global/a\        winbind enum groups = no' /etc/samba/smb.conf
+sed -i '/global/a\        winbind refresh tickets = yes' /etc/samba/smb.conf
+sed -i '/global/a\        winbind offline logon = yes' /etc/samba/smb.conf
+sed -i '/global/a\        idmap config * : range = 200000-2000200000' /etc/samba/smb.conf
+sed -i '/global/a\        idmap config * : backend = sss' /etc/samba/smb.conf
+sed -i '/systemd/s/$/ sss/' /etc/nsswitch.conf
+sed -i '/shadow/s/$/ sss/' /etc/nsswitch.conf
+sed -i '/group/s/$/ [SUCCESS=merge] sss role systemd/' /etc/nsswitch.conf
+
+# Настройка аутентификации
+control system-auth sss
+systemctl enable --now sssd
+net ads keytab create
+systemctl disable --now nscd
+
+# Перезагрузка компьютера
+init 6
